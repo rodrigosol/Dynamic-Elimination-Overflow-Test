@@ -1,0 +1,450 @@
+diff -r b7869eca1558 js/src/Makefile.in
+--- a/js/src/Makefile.in	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/Makefile.in	Thu Oct 07 16:54:35 2010 -0300
+@@ -162,6 +162,8 @@
+ 		jswrapper.cpp \
+ 		jsxdrapi.cpp \
+ 		jsxml.cpp \
++		jsbytecodeopt.cpp \
++		jsconstraintgraph.cpp \
+ 		prmjtime.cpp \
+ 		$(NULL)
+ 
+@@ -236,6 +238,8 @@
+ 		jsval.h \
+ 		jsvalue.h \
+ 		prmjtime.h \
++		jsbytecodeopt.h \
++		jsconstraintgraph.h \
+ 		$(NULL)
+ 
+ ifdef ENABLE_TRACEJIT
+diff -r b7869eca1558 js/src/Makefile.ref
+--- a/js/src/Makefile.ref	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/Makefile.ref	Thu Oct 07 16:54:35 2010 -0300
+@@ -206,6 +206,8 @@
+ 	jsregexp.h	\
+ 	jsscan.h	\
+ 	jsscope.h	\
++	jsbytecodeopt.h \
++	jsconstraintgraph.h \
+ 	jsscript.h	\
+ 	jsstr.h		\
+ 	jsversion.h	\
+@@ -297,6 +299,8 @@
+ 	jsutil.cpp	\
+ 	jsxdrapi.cpp	\
+ 	jsxml.cpp	\
++	jsbytecodeopt.cpp \
++	jsconstraintgraph.cpp \
+ 	prmjtime.cpp	\
+ 	$(NULL)
+ 
+diff -r b7869eca1558 js/src/jsinterp.cpp
+--- a/js/src/jsinterp.cpp	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/jsinterp.cpp	Thu Oct 07 16:54:35 2010 -0300
+@@ -87,6 +87,8 @@
+ #include "jsscriptinlines.h"
+ #include "jsstrinlines.h"
+ 
++#include "jsbytecodeopt.h"
++
+ #if JS_HAS_XML_SUPPORT
+ #include "jsxml.h"
+ #endif
+@@ -1981,6 +1983,7 @@
+ 
+ # define DO_OP()            JS_BEGIN_MACRO                                    \
+                                 CHECK_RECORDER();                             \
++                                overOtm.js_RecorderBytecode(regs.pc);  		  \
+                                 JS_EXTENSION_(goto *jumpTable[op]);           \
+                             JS_END_MACRO
+ # define DO_NEXT_OP(n)      JS_BEGIN_MACRO                                    \
+@@ -2108,7 +2111,9 @@
+         if (TRACING_ENABLED(cx)) {                                            \
+             MonitorResult r = MonitorLoopEdge(cx, inlineCallCount);           \
+             if (r == MONITOR_RECORDING) {                                     \
+-                JS_ASSERT(TRACE_RECORDER(cx));                                \
++				TraceRecorder* tr = TRACE_RECORDER(cx);						  \
++                tr->overflowOpt = &overOtm;									  \
++				JS_ASSERT(TRACE_RECORDER(cx));                                \
+                 MONITOR_BRANCH_TRACEVIS;                                      \
+                 ENABLE_INTERRUPTS();                                          \
+                 CLEAR_LEAVE_ON_TRACE_POINT();                                 \
+@@ -2195,6 +2200,7 @@
+     /* Copy in hot values that change infrequently. */
+     JSRuntime *const rt = cx->runtime;
+     JSScript *script = regs.fp->script();
++    JSOverflowOptimization overOtm(cx,script);
+     Value *argv = regs.fp->maybeFormalArgs();
+     CHECK_INTERRUPT_HANDLER();
+ 
+diff -r b7869eca1558 js/src/jstracer.cpp
+--- a/js/src/jstracer.cpp	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/jstracer.cpp	Thu Oct 07 16:54:35 2010 -0300
+@@ -76,6 +76,7 @@
+ #include "jstracer.h"
+ #include "jsxml.h"
+ #include "jstypedarray.h"
++#include <vector>
+ 
+ #include "jsatominlines.h"
+ #include "jscntxtinlines.h"
+@@ -1745,10 +1746,10 @@
+         z = Interval::sub(x, y);
+         *needsNegZeroCheck = false;
+         break;
+-        
++
+       case LIR_muli: {
+         z = Interval::mul(x, y);
+-        // A would-be negative zero result can only occur if we have 
++        // A would-be negative zero result can only occur if we have
+         // mul(0, -n) or mul(-n, 0), where n != 0.  In particular, a multiply
+         // where one operand is a positive immediate cannot result in negative
+         // zero.
+@@ -4279,7 +4280,7 @@
+     } else if (pendingSpecializedNative &&
+                (pendingSpecializedNative->flags & JSTN_RETURN_NULLABLE_OBJ)) {
+         typemap[stackSlots - 1] = JSVAL_TYPE_OBJORNULL;
+-    } 
++    }
+ 
+     /* Now restore the the original pc (after which early returns are ok). */
+     if (resumeAfter) {
+@@ -4435,6 +4436,7 @@
+     }
+ 
+     LIns* guardIns = lir->insGuardXov(op, d0, d1, guardRec);
++    overflowOpt->js_AddInstructions(guardIns);
+     NanoAssert(guardIns);
+     return guardIns;
+ }
+@@ -4551,7 +4553,25 @@
+ 
+     Assembler *assm = traceMonitor->assembler;
+     JS_ASSERT(assm->error() == nanojit::None);
+-    assm->compile(fragment, tempAlloc(), /*optimize*/true verbose_only(, lirbuf->printer));
++
++    std::vector<nanojit::LIns*> *removables = NULL;
++    removables = new std::vector<nanojit::LIns*>();
++    ////	overflowOpt->dot("/Users/rodrigosol/opt/new_tm4/tracemonkey/js/src/build-debug/before.dot");
++    overflowOpt->getRemovables(removables);
++    ////	overflowOpt->dot("/Users/rodrigosol/opt/new_tm4/tracemonkey/js/src/build-debug/after.dot");
++    assm->overflowMap = removables;
++    	overflowOpt->printStats();
++
++    	assm->compile(fragment, tempAlloc(), /*optimize*/true verbose_only(, lirbuf->printer));
++
++    	fprintf(stderr,"\nOV_BYTES:%d\n",assm->codeBytes);
++		fprintf(stderr,"\nOV_EXITS:%d\n",assm->exitBytes);
++    //
++    	if (removables) {
++              removables->clear();
++    		  delete removables;
++        }
++
+ 
+     if (assm->error() != nanojit::None) {
+         assm->setError(nanojit::None);
+@@ -4753,7 +4773,7 @@
+             JS_ASSERT(info.type == JSVAL_TYPE_INT32 || info.type == JSVAL_TYPE_DOUBLE);
+             /*
+              * This should only happen if the slot has a trivial conversion, i.e.
+-             * isPromoteInt() is true.  We check this.  
++             * isPromoteInt() is true.  We check this.
+              *
+              * Note that getFromTracker() will return NULL if the slot was
+              * never used, in which case we don't do the check.  We could
+@@ -4763,7 +4783,7 @@
+              */
+             LIns* ins = mRecorder.getFromTrackerImpl(info.vp);
+             JS_ASSERT_IF(ins, isPromoteInt(ins));
+-        } else 
++        } else
+ #endif
+         if (info.lastCheck == TypeCheck_Demote) {
+             JS_ASSERT(info.type == JSVAL_TYPE_INT32 || info.type == JSVAL_TYPE_DOUBLE);
+@@ -4818,7 +4838,7 @@
+     DefaultSlotMap(TraceRecorder& tr) : SlotMap(tr)
+     {
+     }
+-    
++
+     virtual ~DefaultSlotMap()
+     {
+     }
+@@ -6227,7 +6247,7 @@
+ 
+     } else if (v.isDouble()) {
+         int32_t _;
+-        ok = (type == JSVAL_TYPE_DOUBLE) || 
++        ok = (type == JSVAL_TYPE_DOUBLE) ||
+              (type == JSVAL_TYPE_INT32 && JSDOUBLE_IS_INT32(v.toDouble(), &_));
+ 
+     } else if (v.isObject()) {
+@@ -7232,6 +7252,12 @@
+ TraceRecorder::monitorRecording(JSOp op)
+ {
+     TraceMonitor &localtm = JS_TRACE_MONITOR(cx);
++
++//    if (!(LogController.lcbits & LC_TMDisOvx)) {
++        overflowOpt->js_AnaliseBytecode();
++ //   }
++
++
+     debug_only_stmt( JSContext *localcx = cx; )
+ 
+     /* Process needFlush requests now. */
+@@ -7949,7 +7975,7 @@
+     JSScript *script = cx->fp()->script();
+     atoms = FrameAtomBase(cx, cx->fp());
+     consts = cx->fp()->hasImacropc() || script->constOffset == 0
+-           ? 0 
++           ? 0
+            : script->consts()->vector;
+     strictModeCode_ins = addName(lir->insImmI(script->strictModeCode), "strict");
+ }
+@@ -8632,7 +8658,7 @@
+         high = GET_JUMPX_OFFSET(pc);
+     }
+ 
+-    /* 
++    /*
+      * If there are no cases, this is a no-op. The default case immediately
+      * follows in the bytecode and is always taken, so we need no special
+      * action to handle it.
+@@ -9498,7 +9524,7 @@
+ }
+ 
+ void
+-TraceRecorder::stobj_set_dslot(LIns *obj_ins, unsigned slot, LIns*& dslots_ins, 
++TraceRecorder::stobj_set_dslot(LIns *obj_ins, unsigned slot, LIns*& dslots_ins,
+                                const Value &v, LIns* v_ins)
+ {
+     if (!dslots_ins)
+@@ -9693,7 +9719,7 @@
+             lir->insStore(payload_ins, dstaddr_ins, offset + sPayloadOffset, accSet);
+         } else if (isPromoteInt(v_ins)) {
+             LIns *int_ins = demote(lir, v_ins);
+-            lir->insStore(INS_CONSTU(JSVAL_TAG_INT32), dstaddr_ins, 
++            lir->insStore(INS_CONSTU(JSVAL_TAG_INT32), dstaddr_ins,
+                           offset + sTagOffset, accSet);
+             lir->insStore(int_ins, dstaddr_ins, offset + sPayloadOffset, accSet);
+         } else {
+@@ -9959,7 +9985,7 @@
+         return RECORD_CONTINUE;
+     }
+ 
+-    JS_ASSERT(fp->callee().getGlobal() == globalObj);    
++    JS_ASSERT(fp->callee().getGlobal() == globalObj);
+     const Value& thisv = fp->thisValue();
+ 
+     if (!thisv.isNull()) {
+@@ -12128,7 +12154,7 @@
+         SetBuiltinError(cx);
+         return false;
+     }
+-    
++
+     /* Delegate to the op, if present. */
+     PropertyIdOp op = obj->getOps()->getProperty;
+     if (op) {
+@@ -12160,7 +12186,7 @@
+          */
+         picTable->update(obj->shape(), id, shape->slot);
+     }
+-    
++
+     return cx->tracerState->builtinStatus == 0;
+ }
+ JS_DEFINE_CALLINFO_5(static, BOOL_FAIL, GetPropertyByName, CONTEXT, OBJECT, STRINGPTR, VALUEPTR,
+@@ -12655,7 +12681,7 @@
+     }
+     return cx->tracerState->builtinStatus == 0;
+ }
+-JS_DEFINE_CALLINFO_5(static, BOOL_FAIL, SetPropertyByName, 
++JS_DEFINE_CALLINFO_5(static, BOOL_FAIL, SetPropertyByName,
+                      CONTEXT, OBJECT, STRINGPTR, VALUEPTR, BOOL,
+                      0, ACCSET_STORE_ANY)
+ 
+@@ -12791,7 +12817,7 @@
+         LIns* priv_ins = stobj_get_private(obj_ins);
+ 
+         // The index was on the stack and is therefore a LIR float; force it to
+-        // be an integer.                              
++        // be an integer.
+         idx_ins = makeNumberInt32(idx_ins);
+ 
+         // Ensure idx >= 0 && idx < length (by using uint32)
+@@ -12861,7 +12887,7 @@
+             // Do nothing, this is already a float
+             break;
+           default:
+-            JS_NOT_REACHED("Unknown typed array type in tracer");       
++            JS_NOT_REACHED("Unknown typed array type in tracer");
+         }
+ 
+         switch (tarray->type) {
+@@ -12890,7 +12916,7 @@
+             lir->insStore(LIR_std, typed_v_ins, addr_ins, 0, ACCSET_OTHER);
+             break;
+           default:
+-            JS_NOT_REACHED("Unknown typed array type in tracer");       
++            JS_NOT_REACHED("Unknown typed array type in tracer");
+         }
+     } else if (idx.toInt32() < 0 || !obj->isDenseArray()) {
+         CHECK_STATUS_A(initOrSetPropertyByIndex(obj_ins, idx_ins, &v,
+@@ -12901,7 +12927,7 @@
+         VMSideExit* mismatchExit = snapshot(MISMATCH_EXIT);
+ 
+         // Make sure the array is actually dense.
+-        if (!obj->isDenseArray()) 
++        if (!obj->isDenseArray())
+             return ARECORD_STOP;
+         guardDenseArray(obj_ins, branchExit);
+ 
+diff -r b7869eca1558 js/src/jstracer.h
+--- a/js/src/jstracer.h	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/jstracer.h	Thu Oct 07 16:54:35 2010 -0300
+@@ -52,6 +52,7 @@
+ #include "jslock.h"
+ #include "jsnum.h"
+ #include "jsvector.h"
++#include "jsbytecodeopt.h"
+ 
+ namespace js {
+ 
+@@ -1426,7 +1427,8 @@
+     friend class BoxArg;
+ 
+ public:
+-    static bool JS_REQUIRES_STACK
++	JSOverflowOptimization* overflowOpt;
++	static bool JS_REQUIRES_STACK
+     startRecorder(JSContext*, VMSideExit*, VMFragment*,
+                   unsigned stackSlots, unsigned ngslots, JSValueType* typeMap,
+                   VMSideExit* expectedInnerExit, jsbytecode* outerTree,
+diff -r b7869eca1558 js/src/nanojit/Assembler.cpp
+--- a/js/src/nanojit/Assembler.cpp	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/nanojit/Assembler.cpp	Thu Oct 07 16:54:35 2010 -0300
+@@ -1884,6 +1884,15 @@
+                     ins->oprnd1()->setResultLive();
+                     ins->oprnd2()->setResultLive();
+                     if (ins->isExtant()) {
++                        if(overflowMap && overflowMap->size() != 0){
++                     	   //fprintf(stderr,"\nfront %:d",overflowMap->back());
++                            if(overflowMap->back() == ins) {
++                                overflowMap->pop_back();
++                            	asm_arith(ins);
++                            	//fprintf(stderr,"\n***************OK**************");
++                            	break;
++                            }
++                        }
+                         NIns* exit = asm_exit(ins); // does intersectRegisterState()
+                         asm_branch_ov(op, exit);
+                         asm_arith(ins);
+diff -r b7869eca1558 js/src/nanojit/Assembler.h
+--- a/js/src/nanojit/Assembler.h	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/nanojit/Assembler.h	Thu Oct 07 16:54:35 2010 -0300
+@@ -40,7 +40,7 @@
+ 
+ #ifndef __nanojit_Assembler__
+ #define __nanojit_Assembler__
+-
++#include <vector>
+ 
+ namespace nanojit
+ {
+@@ -271,7 +271,10 @@
+             #endif // NJ_VERBOSE
+ 
+         public:
+-            #ifdef VMCFG_VTUNE
++        	std::vector<nanojit::LIns*> *overflowMap;
++            size_t      codeBytes;              // bytes allocated in normal code chunks
++			size_t      exitBytes;              // bytes allocated in exit code chunks
++        	#ifdef VMCFG_VTUNE
+             void* vtuneHandle;
+             #endif
+ 
+@@ -393,8 +396,8 @@
+             NIns*       _nExitIns;              // current instruction in current exit code chunk
+                                                 // note: _nExitIns == NULL until the first side exit is seen.
+         #ifdef NJ_VERBOSE
+-            size_t      codeBytes;              // bytes allocated in normal code chunks
+-            size_t      exitBytes;              // bytes allocated in exit code chunks
++
++
+         #endif
+ 
+             #define     SWAP(t, a, b)   do { t tmp = a; a = b; b = tmp; } while (0)
+diff -r b7869eca1558 js/src/shell/js.cpp
+--- a/js/src/shell/js.cpp	Fri Sep 24 20:19:43 2010 -0400
++++ b/js/src/shell/js.cpp	Thu Oct 07 16:54:35 2010 -0300
+@@ -77,6 +77,7 @@
+ #include "jstracer.h"
+ #include "jsxml.h"
+ #include "jsperf.h"
++#include <sys/time.h>
+ 
+ #include "prmjtime.h"
+ 
+@@ -402,6 +403,7 @@
+         file = stdin;
+     } else {
+         file = fopen(filename, "r");
++        fprintf(stderr,"\nOV_FILENAME:%s\n",filename);
+         if (!file) {
+             JS_ReportErrorNumber(cx, my_GetErrorMessage, NULL,
+                                  JSSMSG_CANT_OPEN, filename, strerror(errno));
+@@ -1538,7 +1540,7 @@
+                              JSSMSG_NOT_ENOUGH_ARGS, "setDebug");
+         return JS_FALSE;
+     }
+-    
++
+     js_SetDebugMode(cx, JSVAL_TO_BOOLEAN(argv[0]));
+     JS_SET_RVAL(cx, vp, JSVAL_VOID);
+     return JS_TRUE;
+@@ -2174,7 +2176,7 @@
+         char *name = JS_GetStringBytes(JSVAL_TO_STRING(argv[0]));
+         file = fopen(name, "w");
+         if (!file) {
+-            JS_ReportError(cx, "tracing: couldn't open output file %s: %s", 
++            JS_ReportError(cx, "tracing: couldn't open output file %s: %s",
+                            name, strerror(errno));
+             return JS_FALSE;
+         }
+@@ -5273,7 +5275,7 @@
+ }
+ 
+ int
+-main(int argc, char **argv, char **envp)
++main2(int argc, char **argv, char **envp)
+ {
+     int stackDummy;
+     JSRuntime *rt;
+@@ -5358,3 +5360,22 @@
+     JS_ShutDown();
+     return result;
+ }
++
++double computeTime(struct timeval* start, struct timeval* end) {
++  double mtime = end->tv_sec - start->tv_sec;
++  double utime = end->tv_usec - start->tv_usec;
++  return mtime + (utime/1000000);
++}
++
++int main(int argc, char **argv, char **envp){
++    double results = 0;
++    struct timeval start,end;
++//    for(int i = 0; i < 3; i++){
++        gettimeofday(&start,NULL);
++        main2(argc,argv,envp);
++        gettimeofday(&end,NULL);
++        fprintf(stderr,"\nOV_TIME:%lf\n",computeTime(&start, &end));
++//    }
++
++
++}
