@@ -1,0 +1,7 @@
+Steps to Apply the patch
+----------------------------------
+
+1 - Get TraceMonkey Repository
+hg clone hg.mozilla.org/tracemonkey/
+
+2 - Apply overflow.patch to the repository
